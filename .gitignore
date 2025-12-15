@@ -12,3 +12,10 @@ results/
 .ipynb_checkpoints
 .vscode/
 
+# Arquivos grandes (modelos e resultados)
+*.pth
+*.zip
+*.tar.gz
+notebooks/checkpoints/
+notebooks/results/
+

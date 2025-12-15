@@ -19,6 +19,40 @@ import json
 
 # ==================== LOSS FUNCTIONS ====================
 
+class LabelSmoothingCrossEntropy(nn.Module):
+    """CrossEntropyLoss com Label Smoothing para melhor generalização"""
+    
+    def __init__(self, smoothing: float = 0.1):
+        super(LabelSmoothingCrossEntropy, self).__init__()
+        self.smoothing = smoothing
+        self.confidence = 1.0 - smoothing
+    
+    def forward(self, predictions, targets):
+        import torch.nn.functional as F
+        log_probs = F.log_softmax(predictions, dim=-1)
+        nll_loss = -log_probs.gather(dim=-1, index=targets.unsqueeze(1))
+        nll_loss = nll_loss.squeeze(1)
+        smooth_loss = -log_probs.mean(dim=-1)
+        loss = self.confidence * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss para lidar com desbalanceamento de classes"""
+    
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, predictions, targets):
+        import torch.nn.functional as F
+        ce_loss = F.cross_entropy(predictions, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+
 class DiceLoss(nn.Module):
     """Dice Loss para segmentação"""
     
@@ -58,11 +92,20 @@ class DiceBCELoss(nn.Module):
         return self.dice_weight * dice_loss + self.bce_weight * bce_loss
 
 
-def get_loss_function(loss_name: str, device: str = 'cuda'):
+def get_loss_function(loss_name: str, device: str = 'cuda', config: dict = None):
     """Factory para loss functions"""
     
     if loss_name == 'cross_entropy':
         return nn.CrossEntropyLoss().to(device)
+    
+    elif loss_name == 'label_smoothing':
+        smoothing = config['training']['label_smoothing'] if config else 0.1
+        return LabelSmoothingCrossEntropy(smoothing=smoothing).to(device)
+    
+    elif loss_name == 'focal':
+        alpha = config['training']['focal_alpha'] if config else 0.25
+        gamma = config['training']['focal_gamma'] if config else 2.0
+        return FocalLoss(alpha=alpha, gamma=gamma).to(device)
     
     elif loss_name == 'dice':
         return DiceLoss().to(device)

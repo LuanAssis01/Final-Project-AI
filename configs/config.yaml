@@ -1,21 +1,21 @@
 # Paths
 paths:
-  data_dir: './data'
-  train_images: './data/train_images'
-  train_masks: './data/train_masks'
-  test_images: './data/test_images'
-  supplemental_images: './data/supplemental_images'
-  supplemental_masks: './data/supplemental_masks'
-  checkpoints_dir: './checkpoints'
-  results_dir: './results'
-  submission_file: './data/sample_submission.csv'
+  data_dir: "./data"
+  train_images: "./data/train_images"
+  train_masks: "./data/train_masks"
+  test_images: "./data/test_images"
+  supplemental_images: "./data/supplemental_images"
+  supplemental_masks: "./data/supplemental_masks"
+  checkpoints_dir: "./checkpoints"
+  results_dir: "./results"
+  submission_file: "./data/sample_submission.csv"
 
 # Dataset
 dataset:
-  image_size: 512  # Redimensionar imagens para 512x512
-  train_split: 0.8  # 80% treino, 20% validação
-  batch_size: 8  # Ajustar conforme VRAM disponível (6GB)
-  num_workers: 4
+  image_size: 256 # Otimizado: 256 é 4x mais rápido que 512
+  train_split: 0.8 # 80% treino, 20% validação
+  batch_size: 32 # Ajustado para RTX 4050 (6GB VRAM)
+  num_workers: 2 # Ajustado para máquina local
   pin_memory: true
   seed: 42
 
@@ -23,13 +23,19 @@ augmentation:
   train:
     horizontal_flip: 0.5
     vertical_flip: 0.5
-    rotation: 15
-    brightness: 0.2
-    contrast: 0.2
+    rotation: 30 # Aumentado de 15 para 30 graus
+    brightness: 0.3 # Aumentado de 0.2 para 0.3
+    contrast: 0.3 # Aumentado de 0.2 para 0.3
+    # Novos augmentations (aplicados automaticamente via datasets.py):
+    # - ShiftScaleRotate: shift_limit=0.1, scale_limit=0.2
+    # - HueSaturationValue: hue=20, sat=30, val=20
+    # - GaussNoise: var_limit=(10.0, 50.0), p=0.3
+    # - GaussianBlur: blur_limit=(3, 5), p=0.3
+    # - CoarseDropout: max_holes=8, max_height=32, max_width=32, p=0.3
     normalize:
       mean: [0.485, 0.456, 0.406]
       std: [0.229, 0.224, 0.225]
-  
+
   val:
     normalize:
       mean: [0.485, 0.456, 0.406]
@@ -38,88 +44,100 @@ augmentation:
 # Modelos a serem comparados
 models:
   simple_cnn:
-    name: 'SimpleCNN'
+    name: "SimpleCNN"
     input_channels: 3
-    num_classes: 2  # authentic vs forged
-    base_filters: 32
-    
+    num_classes: 2 # authentic vs forged
+    base_filters: 64 # Aumentado de 32 para 64 - mais capacidade
+    # Arquitetura APRIMORADA com:
+    # - Residual Blocks (melhor fluxo de gradiente)
+    # - Squeeze-and-Excitation Attention
+    # - BatchNorm em todas as camadas
+    # - Classificador profundo (3 camadas FC)
+
   resnet_transfer:
-    name: 'ResNet50Transfer'
-    backbone: 'resnet50'
+    name: "ResNet50Transfer"
+    backbone: "resnet50"
     pretrained: true
     num_classes: 2
-    freeze_backbone: false  # Fine-tuning
-    
-  unet_segmentation:
-    name: 'UNet'
-    encoder_name: 'resnet34'  # Encoder pré-treinado
-    encoder_weights: 'imagenet'
-    in_channels: 3
-    classes: 1  # Máscara binária (forged region)
+    freeze_backbone: false # Fine-tuning
+    # Arquitetura APRIMORADA com:
+    # - Head com 3 camadas fully connected
+    # - BatchNorm após cada camada linear
 
+  unet_segmentation:
+    name: "UNet"
+    encoder_name: "resnet34" # backbone do encoder
+    encoder_weights: "imagenet" # pesos pré-treinados
+    in_channels: 3 # RGB images
+    classes: 1 # segmentação binária (1 canal de saída)
 # Training
 training:
-  epochs: 50
-  patience: 10  
-  learning_rate: 0.001
+  epochs: 20 # Aumentado de 30 para 50
+  patience: 15 # Aumentado de 10 para 15 épocas
+  learning_rate: 0.0003 # Reduzido de 0.001 para 0.0003 - mais estável
   weight_decay: 0.0001
-  optimizer: 'adam'  # adam, sgd, adamw
-  scheduler: 'reduce_on_plateau'  # reduce_on_plateau, cosine_annealing
-  
-  # Loss functions
+  optimizer: "adamw" # Mudado de 'adam' para 'adamw' - melhor regularização
+  scheduler: "reduce_on_plateau" # reduce_on_plateau, cosine_annealing
+
+  # Loss functions (novas opções disponíveis)
   loss:
-    simple_cnn: 'cross_entropy'
-    resnet_transfer: 'cross_entropy'
-    unet_segmentation: 'dice_bce'  # Combinação Dice + BCE para segmentação
-  
+    simple_cnn: "label_smoothing" # 'cross_entropy', 'label_smoothing', 'focal'
+    resnet_transfer: "label_smoothing" # 'cross_entropy', 'label_smoothing', 'focal'
+    unet_segmentation: "dice_bce" # Combinação Dice + BCE para segmentação
+
+  # Loss function configurations
+  label_smoothing: 0.1 # Smoothing factor para Label Smoothing
+  focal_alpha: 0.25 # Alpha para Focal Loss
+  focal_gamma: 2.0 # Gamma para Focal Loss
+
   # Class weights (para dataset desbalanceado)
   use_class_weights: true
-  
+
   # Mixed precision training (economizar VRAM)
   mixed_precision: true
-  
+
   # Gradient clipping
   clip_grad_norm: 1.0
 
 # Validation
 validation:
-  eval_frequency: 1  # Avaliar a cada epoch
+  eval_frequency: 1 # Avaliar a cada epoch
   save_best_only: true
-  metric_for_best: 'f1_score'  # f1_score, accuracy, iou
+  metric_for_best: "f1_score" # f1_score, accuracy, iou
 
 # Metrics
 metrics:
-  classification:  # Para SimpleCNN e ResNet
-    - 'accuracy'
-    - 'precision'
-    - 'recall'
-    - 'f1_score'
-    - 'auc_roc'
-    - 'confusion_matrix'
-  
-  segmentation:  # Para UNet
-    - 'pixel_accuracy'
-    - 'iou'  # Intersection over Union
-    - 'dice_coefficient'
-    - 'precision'
-    - 'recall'
+  classification: # Para SimpleCNN e ResNet
+    - "accuracy"
+    - "precision"
+    - "recall"
+    - "f1_score"
+    - "auc_roc"
+    - "confusion_matrix"
+
+  segmentation: # Para UNet
+    - "pixel_accuracy"
+    - "iou" # Intersection over Union
+    - "dice_coefficient"
+    - "precision"
+    - "recall"
 
 # Inference
 inference:
   batch_size: 16
-  tta: false  # Test Time Augmentation
-  threshold: 0.5  # Para classificação binária
+  tta: false # Test Time Augmentation
+  threshold: 0.5 # Para classificação binária
 
 # Logging
 logging:
-  log_dir: './logs'
+  log_dir: "./logs"
   tensorboard: true
-  save_frequency: 5  # Salvar checkpoint a cada N epochs
+  save_frequency: 5 # Salvar checkpoint a cada N epochs
   verbose: true
 
 # Hardware
 hardware:
-  device: 'cuda'  # cuda ou cpu
+  device: "cuda" # cuda ou cpu
   gpu_id: 0
   deterministic: true
-  benchmark: false  # Otimização para inputs de tamanho fixo
+  benchmark: false # Otimização para inputs de tamanho fixo

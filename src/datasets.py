@@ -1,8 +1,3 @@
-"""
-Dataset classes para Scientific Image Forgery Detection
-Trabalho Final IA
-"""
-
 import os
 import numpy as np
 import torch
@@ -13,6 +8,45 @@ from albumentations.pytorch import ToTensorV2
 from pathlib import Path
 from typing import Tuple, Optional, Dict
 import cv2
+
+
+def load_and_fix_mask(mask_path: str) -> np.ndarray:
+    """
+    Carrega e corrige máscaras com shapes inconsistentes
+    
+    Args:
+        mask_path: Caminho para o arquivo .npy da máscara
+        
+    Returns:
+        Máscara 2D de shape (H, W)
+    """
+    try:
+        mask = np.load(mask_path)
+        
+        # Se a máscara tem 3 dimensões
+        if mask.ndim == 3:
+            # Para máscaras multi-canal, usa max() para combinar
+            if mask.shape[0] in [1, 2, 3, 4]:  # canais na primeira dimensão
+                mask = mask.max(axis=0)  # (C, H, W) -> (H, W)
+            elif mask.shape[2] in [1, 2, 3, 4]:  # canais na última dimensão
+                mask = mask.max(axis=2)  # (H, W, C) -> (H, W)
+            else:
+                # Fallback: usar squeeze para remover dimensões de tamanho 1
+                mask = np.squeeze(mask)
+        
+        # Garantir que é 2D
+        while mask.ndim > 2:
+            mask = mask.max(axis=0)
+        
+        # Binarizar a máscara (0 ou 1)
+        mask = (mask > 0).astype(np.float32)
+        
+        return mask
+        
+    except Exception as e:
+        print(f"Error loading mask {mask_path}: {e}")
+        # Retorna máscara vazia em caso de erro
+        return np.zeros((256, 256), dtype=np.float32)
 
 
 class ForgeryClassificationDataset(Dataset):
@@ -35,16 +69,13 @@ class ForgeryClassificationDataset(Dataset):
         """
         self.image_size = image_size
         self.transform = transform
-        
-        # Carregar paths de imagens autênticas
+
         self.authentic_images = sorted(list(Path(authentic_dir).glob('*.jpg')) + 
                                       list(Path(authentic_dir).glob('*.png')))
         
-        # Carregar paths de imagens forged
         self.forged_images = sorted(list(Path(forged_dir).glob('*.jpg')) + 
                                    list(Path(forged_dir).glob('*.png')))
-        
-        # Criar lista completa de imagens e labels
+
         self.images = self.authentic_images + self.forged_images
         self.labels = [0] * len(self.authentic_images) + [1] * len(self.forged_images)
         
@@ -55,7 +86,6 @@ class ForgeryClassificationDataset(Dataset):
         return len(self.images)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        # Carregar imagem
         img_path = str(self.images[idx])
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -95,29 +125,32 @@ class ForgerySegmentationDataset(Dataset):
         self.transform = transform
         self.image_size = image_size
         
-        # Listar todas as máscaras disponíveis
+        self.samples = []
+        skipped = 0
+        
+        # CORRIGIDO: Definir mask_files primeiro
         mask_files = sorted(list(Path(masks_dir).glob('*.npy')))
         
-        self.samples = []
-        
-        # Adicionar imagens forged com máscaras
+        # CORRIGIDO: Agora o loop funciona corretamente
         for mask_path in mask_files:
-            # Nome do arquivo sem extensão
             img_id = mask_path.stem
-            
-            # Procurar imagem correspondente
+
             img_path = self.images_dir / 'forged' / f"{img_id}.jpg"
             if not img_path.exists():
                 img_path = self.images_dir / 'forged' / f"{img_id}.png"
             
             if img_path.exists():
-                self.samples.append({
-                    'image': img_path,
-                    'mask': mask_path,
-                    'has_forgery': True
-                })
+                # Verificar se a imagem pode ser carregada
+                test_img = cv2.imread(str(img_path))
+                if test_img is not None:
+                    self.samples.append({
+                        'image': img_path,
+                        'mask': mask_path,
+                        'has_forgery': True
+                    })
+                else:
+                    skipped += 1
         
-        # Adicionar imagens autênticas (máscara vazia)
         if include_authentic:
             authentic_dir = self.images_dir / 'authentic'
             if authentic_dir.exists():
@@ -125,13 +158,20 @@ class ForgerySegmentationDataset(Dataset):
                                   list(authentic_dir.glob('*.png')))
                 
                 for img_path in authentic_images[:len(self.samples)]:  # Balancear
-                    self.samples.append({
-                        'image': img_path,
-                        'mask': None,
-                        'has_forgery': False
-                    })
+                    # Verificar se a imagem pode ser carregada
+                    test_img = cv2.imread(str(img_path))
+                    if test_img is not None:
+                        self.samples.append({
+                            'image': img_path,
+                            'mask': None,
+                            'has_forgery': False
+                        })
+                    else:
+                        skipped += 1
         
         print(f"Segmentation dataset: {len(self.samples)} amostras")
+        if skipped > 0:
+            print(f"  (Skipped {skipped} corrupted/unreadable images)")
     
     def __len__(self) -> int:
         return len(self.samples)
@@ -141,24 +181,35 @@ class ForgerySegmentationDataset(Dataset):
         
         # Carregar imagem
         image = cv2.imread(str(sample['image']))
+        if image is None:
+            raise ValueError(f"Failed to load image: {sample['image']}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Carregar ou criar máscara
+        # CORRIGIDO: Usar load_and_fix_mask para carregar máscaras
         if sample['mask'] is not None:
-            mask = np.load(str(sample['mask']))
-            # Garantir máscara binária
-            mask = (mask > 0).astype(np.float32)
+            try:
+                mask = load_and_fix_mask(str(sample['mask']))
+                
+                # Redimensionar máscara para o tamanho da imagem se necessário
+                if mask.shape[0] != image.shape[0] or mask.shape[1] != image.shape[1]:
+                    if image.shape[0] > 0 and image.shape[1] > 0:
+                        mask = cv2.resize(mask, (image.shape[1], image.shape[0]), 
+                                         interpolation=cv2.INTER_NEAREST)
+                    else:
+                        raise ValueError(f"Invalid image dimensions: {image.shape}")
+            except Exception as e:
+                print(f"Error processing mask {sample['mask']}: {e}")
+                # Criar máscara vazia em caso de erro
+                mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
         else:
             # Máscara vazia para imagens autênticas
             mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
         
-        # Aplicar transformações (augmentation deve aplicar mesma transformação em image e mask)
         if self.transform:
             transformed = self.transform(image=image, mask=mask)
             image = transformed['image']
             mask = transformed['mask']
         
-        # Adicionar dimensão de canal à máscara
         mask = mask.unsqueeze(0)
         
         return image, mask
@@ -166,7 +217,7 @@ class ForgerySegmentationDataset(Dataset):
 
 def get_transforms(config: Dict, mode: str = 'train') -> A.Compose:
     """
-    Cria pipeline de transformações/augmentations
+    Cria pipeline de transformações/augmentations APRIMORADO
     
     Args:
         config: Dicionário de configuração
@@ -183,19 +234,24 @@ def get_transforms(config: Dict, mode: str = 'train') -> A.Compose:
             A.Resize(image_size, image_size),
             A.HorizontalFlip(p=aug_config['horizontal_flip']),
             A.VerticalFlip(p=aug_config['vertical_flip']),
-            A.Rotate(limit=aug_config['rotation'], p=0.5),
+            A.Rotate(limit=aug_config['rotation'], p=0.6),
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=0, p=0.5),
             A.RandomBrightnessContrast(
                 brightness_limit=aug_config['brightness'],
                 contrast_limit=aug_config['contrast'],
-                p=0.5
+                p=0.6
             ),
+            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
+            A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.3),
+            A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.3),
             A.Normalize(
                 mean=aug_config['normalize']['mean'],
                 std=aug_config['normalize']['std']
             ),
             ToTensorV2()
         ]
-    else:  # validation
+    else:  
         transforms = [
             A.Resize(image_size, image_size),
             A.Normalize(
@@ -220,11 +276,9 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     """
     from sklearn.model_selection import train_test_split
     
-    # Paths
     authentic_dir = os.path.join(config['paths']['train_images'], 'authentic')
     forged_dir = os.path.join(config['paths']['train_images'], 'forged')
     
-    # Criar dataset completo
     full_dataset = ForgeryClassificationDataset(
         authentic_dir=authentic_dir,
         forged_dir=forged_dir,
@@ -232,7 +286,6 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         image_size=config['dataset']['image_size']
     )
     
-    # Split train/val
     train_idx, val_idx = train_test_split(
         range(len(full_dataset)),
         test_size=1-config['dataset']['train_split'],
@@ -240,18 +293,15 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         stratify=full_dataset.labels
     )
     
-    # Criar subsets com transformações apropriadas
     train_transform = get_transforms(config, 'train')
     val_transform = get_transforms(config, 'val')
     
     train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
     val_dataset = torch.utils.data.Subset(full_dataset, val_idx)
     
-    # Aplicar transformações
     train_dataset.dataset.transform = train_transform
     val_dataset.dataset.transform = val_transform
     
-    # Criar dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['dataset']['batch_size'],
@@ -283,7 +333,6 @@ def create_segmentation_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoade
     """
     from sklearn.model_selection import train_test_split
     
-    # Criar dataset completo
     full_dataset = ForgerySegmentationDataset(
         images_dir=config['paths']['train_images'],
         masks_dir=config['paths']['train_masks'],
@@ -291,14 +340,12 @@ def create_segmentation_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoade
         image_size=config['dataset']['image_size']
     )
     
-    # Split train/val
     train_idx, val_idx = train_test_split(
         range(len(full_dataset)),
         test_size=1-config['dataset']['train_split'],
         random_state=config['dataset']['seed']
     )
     
-    # Transformações
     train_transform = get_transforms(config, 'train')
     val_transform = get_transforms(config, 'val')
     
@@ -308,7 +355,6 @@ def create_segmentation_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoade
     train_dataset.dataset.transform = train_transform
     val_dataset.dataset.transform = val_transform
     
-    # Dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['dataset']['batch_size'],

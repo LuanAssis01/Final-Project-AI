@@ -12,6 +12,7 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
 
 from models import get_model
 from datasets import create_dataloaders, create_segmentation_dataloaders
@@ -33,8 +34,8 @@ class Evaluator:
         # Criar modelo
         self.model = get_model(model_name, config).to(self.device)
         
-        # Carregar checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        # Carregar checkpoint (PyTorch 2.6+)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Model loaded from {checkpoint_path}")
         print(f"Checkpoint epoch: {checkpoint['epoch']}")
@@ -83,13 +84,13 @@ class Evaluator:
             outputs = self.model(images)
             
             if self.is_segmentation:
-                # Métricas de segmentação
+                # Métricas de segmentação (por batch)
                 batch_metrics = calculate_segmentation_metrics(outputs, targets)
                 
                 for key in all_metrics:
                     all_metrics[key].append(batch_metrics[key])
                 
-                # Salvar para visualização
+                # Guardar para visualização / matriz de confusão
                 all_images.append(images.cpu())
                 all_masks_true.append(targets.cpu())
                 all_masks_pred.append(outputs.cpu())
@@ -129,7 +130,7 @@ class Evaluator:
         # Classification report
         print_classification_report(preds, targets)
         
-        # Confusion matrix
+        # Confusion matrix (por imagem)
         cm_path = self.results_dir / 'confusion_matrix.png'
         plot_confusion_matrix(targets, preds, save_path=cm_path)
         print(f"Confusion matrix saved to {cm_path}")
@@ -155,31 +156,89 @@ class Evaluator:
             print(f"{key}: {value:.4f}")
         print("="*60 + "\n")
         
-        # Salvar métricas
+        # Salvar métricas num CSV
         metrics_df = pd.DataFrame([metrics])
         metrics_path = self.results_dir / 'evaluation_metrics.csv'
         metrics_df.to_csv(metrics_path, index=False)
         print(f"Metrics saved to {metrics_path}")
         
-        # Visualizar exemplos
-        images = torch.cat(images[:4])  # Primeiras 4 batches
-        masks_true = torch.cat(masks_true[:4])
-        masks_pred = torch.cat(masks_pred[:4])
+        # Juntar alguns batches para visualização
+        images_vis = torch.cat(images[:4])
+        masks_true_vis = torch.cat(masks_true[:4])
+        masks_pred_vis = torch.cat(masks_pred[:4])
         
         vis_path = self.results_dir / 'segmentation_examples.png'
         visualize_segmentation_results(
-            images, masks_true, masks_pred,
+            images_vis, masks_true_vis, masks_pred_vis,
             num_samples=8,
             save_path=vis_path
         )
         print(f"Visualization saved to {vis_path}")
+        
+        # -------- Matriz de confusão por pixel (binária) --------
+        # Converter logits para probabilidade e aplicar threshold
+        threshold = self.config['inference'].get('threshold', 0.5)
+        
+        masks_true_all = torch.cat(masks_true)      # (N, 1, H, W) ou (N, H, W)
+        masks_pred_all = torch.cat(masks_pred)      # (N, 1, H, W)
+        
+        # Garantir formato (N, H, W)
+        if masks_true_all.ndim == 4:
+            masks_true_all = masks_true_all.squeeze(1)
+        if masks_pred_all.ndim == 4:
+            masks_pred_all = masks_pred_all.squeeze(1)
+        
+        # Aplicar sigmoid se necessário (caso modelo não tenha activation)
+        if masks_pred_all.min() < 0 or masks_pred_all.max() > 1:
+            masks_pred_probs = torch.sigmoid(masks_pred_all)
+        else:
+            masks_pred_probs = masks_pred_all
+        
+        masks_pred_bin = (masks_pred_probs > threshold).int()
+        masks_true_bin = (masks_true_all > 0.5).int()
+        
+        # Achatando para vetor 1D de pixels
+        y_true = masks_true_bin.view(-1).cpu().numpy()
+        y_pred = masks_pred_bin.view(-1).cpu().numpy()
+        
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        
+        # Plotar matriz de confusão de segmentação
+        fig, ax = plt.subplots(figsize=(4, 4))
+        im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+        ax.figure.colorbar(im, ax=ax)
+        ax.set(
+            xticks=[0, 1],
+            yticks=[0, 1],
+            xticklabels=['Background', 'Forgery'],
+            yticklabels=['Background', 'Forgery'],
+            ylabel='True label',
+            xlabel='Predicted label',
+            title='Segmentation Confusion Matrix (per pixel)'
+        )
+        
+        # Anotações
+        thresh = cm.max() / 2.0
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(
+                    j, i, format(cm[i, j], 'd'),
+                    ha='center', va='center',
+                    color='white' if cm[i, j] > thresh else 'black'
+                )
+        
+        plt.tight_layout()
+        cm_path = self.results_dir / 'segmentation_confusion_matrix.png'
+        plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Segmentation confusion matrix saved to {cm_path}")
+        # --------------------------------------------------------
         
         return metrics
     
     def compare_models(self, model_results: dict):
         """Compara resultados de múltiplos modelos"""
         
-        # Criar tabela comparativa
         df = pd.DataFrame(model_results).T
         
         print("\n" + "="*60)
@@ -188,12 +247,10 @@ class Evaluator:
         print(df.to_string())
         print("="*60 + "\n")
         
-        # Salvar
         comparison_path = Path(self.config['paths']['results_dir']) / 'model_comparison.csv'
         df.to_csv(comparison_path)
         print(f"Comparison saved to {comparison_path}")
         
-        # Gráfico de barras
         self._plot_model_comparison(df, comparison_path.parent / 'model_comparison.png')
     
     def _plot_model_comparison(self, df: pd.DataFrame, save_path: Path):
@@ -202,7 +259,7 @@ class Evaluator:
         metrics = df.columns.tolist()
         n_metrics = len(metrics)
         
-        fig, axes = plt.subplots(1, n_metrics, figsize=(5*n_metrics, 5))
+        fig, axes = plt.subplots(1, n_metrics, figsize=(5 * n_metrics, 5))
         
         if n_metrics == 1:
             axes = [axes]
@@ -218,24 +275,21 @@ class Evaluator:
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Comparison plot saved to {save_path}")
-        plt.show()
+        plt.close()
 
 
 def evaluate_single_model(config_path: str, model_name: str):
     """Avalia um único modelo"""
     
-    # Carregar config
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Path do checkpoint
     checkpoint_path = Path(config['paths']['checkpoints_dir']) / model_name / 'best_model.pth'
     
     if not checkpoint_path.exists():
         print(f"Checkpoint not found: {checkpoint_path}")
         return None
     
-    # Avaliar
     evaluator = Evaluator(config, model_name, checkpoint_path)
     metrics = evaluator.evaluate()
     
@@ -259,14 +313,16 @@ def evaluate_all_models(config_path: str):
         if metrics:
             results[model_name] = metrics
     
-    # Comparar resultados
     if len(results) > 1:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
         
-        evaluator = Evaluator(config, list(results.keys())[0], 
-                            Path(config['paths']['checkpoints_dir']) / 
-                            list(results.keys())[0] / 'best_model.pth')
+        first_model = list(results.keys())[0]
+        evaluator = Evaluator(
+            config,
+            first_model,
+            Path(config['paths']['checkpoints_dir']) / first_model / 'best_model.pth'
+        )
         
         evaluator.compare_models(results)
 
@@ -274,10 +330,10 @@ def evaluate_all_models(config_path: str):
 def main():
     parser = argparse.ArgumentParser(description='Evaluate Scientific Image Forgery Detection')
     parser.add_argument('--config', type=str, default='configs/config.yaml',
-                       help='Path to config file')
+                        help='Path to config file')
     parser.add_argument('--model', type=str, default='all',
-                       choices=['simple_cnn', 'resnet_transfer', 'unet_segmentation', 'all'],
-                       help='Model to evaluate')
+                        choices=['simple_cnn', 'resnet_transfer', 'unet_segmentation', 'all'],
+                        help='Model to evaluate')
     
     args = parser.parse_args()
     
